@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -19,10 +20,17 @@ func GetTypeOfIdentity(buf byte) uint8 {
 	return buf & 0x07
 }
 
-// TS 24.501 9.11.3.4
-// suci(imsi) =
-// "suci-0-${mcc}-${mnc}-${routingIndentifier}-${protectionScheme}-${homeNetworkPublicKeyIdentifier}-${schemeOutput}"
-// suci(nai) = "nai-${naiString}"
+/* TS 24.501 Section 9.11.3.4 defines different formats for SUPI: IMSI, NSI (NAI), GCI, GLI.
+ * TS 24.501 Section 9.11.3.4 specifies the encoding of IMSI.
+ * TS 23.003 Section 28.7.3 specifies the encoding of NSI.
+ * TS 23.003 Section 28.15.5 specifies the encoding of GCI.
+ * TS 23.003 Section 28.16.5 specifies the encoding of GLI.
+ * The following functions SuciToString and SuciToStringWithError return the SUCI in string format
+ * as sent on the UDM API via the SupiOrSuci data type, as described in Annex C of TS 29.503.
+ * Example format:
+ * suci-${supiType}-${homeNetworkId}-${routingIndicator}-${protectionSchemeId}-${homeNetworkPublicKeyID}-${schemeOutput}
+ */
+
 func SuciToString(buf []byte) (suci string, plmnId string) {
 	var err error
 	suci, plmnId, err = SuciToStringWithError(buf)
@@ -42,8 +50,12 @@ func SuciToStringWithError(buf []byte) (suci string, plmnId string, err error) {
 
 	supiFormat := (buf[0] & 0xf0) >> 4
 	if supiFormat == nasMessage.SupiFormatNai {
-		suci, err = naiToString(buf)
-		return suci, "", err
+		suci, plmnId, err = naiToString(buf[1:])
+		return suci, plmnId, err
+	} else if supiFormat == nasMessage.SupiFormatGCI {
+		return "", "", errors.New("GCI not supported")
+	} else if supiFormat == nasMessage.SupiFormatGLI {
+		return "", "", errors.New("GLI not supported")
 	}
 
 	if len(buf) < 9 {
@@ -106,9 +118,28 @@ func SuciToStringWithError(buf []byte) (suci string, plmnId string, err error) {
 	return suci, plmnId, nil
 }
 
+/* NAI format for SUCI has the form username@realm (Ref. TS 24 501 Sec. 28.7). Where:
+ * realm = [ (nai.)5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org || <NSI realm> ]
+ * username = type<supi type>.rid<routing indicator>.schid<protection scheme id>
+ * [ .userid<MSIN || NSI username> ||
+ * .hnkey<home network public key id>.ecckey<ECC ephemeral public key>.cip<ciphertext>.mac<MAC tag> ||
+ * .hnkey<home network public key id>.out<HPLMN defined scheme output>
+ * ]
+ * The following NaiToString function takes as input a SUCI in NAI format and returns its encoding for the UDM APIs.
+ * The final SUCI string has the form:
+ * "suci-<supi type>-[<MCC>-<MNC> || <NSI realm>]-<routing indicator>-<protection scheme id>-
+ * [<home network public key id> || 0]-[<MSIN> || <NSI username> ||
+ * <ECC ephemeral public key><ciphertext><MAC tag> || <HPLMN defined scheme output>]"
+ */
+
+var reBase = regexp.MustCompile(`^type(\d{1})\.rid(\d{1,4})\.schid(\d{1})`)
+var reHN = regexp.MustCompile(`^\.hnkey(\d{1,3})`)
+var reECC = regexp.MustCompile(`^\.ecckey([^.]+)\.cip([^.]+)\.mac([^.]+)`)
+var rePLMN = regexp.MustCompile(`^.*\.mnc(\d{2,3})\.mcc(\d{3})\.3gppnetwork\.org$`)
+
 func NaiToString(buf []byte) (nai string) {
 	var err error
-	nai, err = naiToString(buf)
+	nai, _, err = naiToString(buf)
 	if err != nil {
 		logger.ConvertLog.Warnf("NaiToString: %+v", err)
 		return ""
@@ -116,15 +147,92 @@ func NaiToString(buf []byte) (nai string) {
 	return
 }
 
-func naiToString(buf []byte) (nai string, err error) {
-	if len(buf) < 2 {
-		return "", errors.New("too short NAI")
+func naiToString(buf []byte) (nai string, plmnId string, err error) {
+	// Split buf in username and realm
+	parts := strings.SplitN(string(buf), "@", 2)
+	if len(parts) != 2 {
+		return "", "", errors.New("invalid NAI format: missing @")
 	}
-	prefix := "nai"
-	naiBytes := buf[1:]
-	naiStr := hex.EncodeToString(naiBytes)
-	nai = strings.Join([]string{prefix, "1", naiStr}, "-")
-	return
+	username := parts[0]
+	realm := parts[1]
+
+	// Parse SUPI type, routing indicator and protection scheme id
+	baseMatch := reBase.FindStringSubmatch(username)
+	if baseMatch == nil || len(baseMatch) < 4 {
+		return "", "", errors.New("invalid NAI username format: missing type, rid or schid")
+	}
+	supiType := baseMatch[1]
+	rid := baseMatch[2]
+	protectionSchemeID := baseMatch[3]
+
+	// Parse Scheme Output (Null, Profile A, Profile B, HPLMN Proprietary)
+	rest := username[len(baseMatch[0]):]
+	schemeOutput := ""
+	homeNetworkPublicKeyID := ""
+	switch {
+	case strings.HasPrefix(rest, ".userid"):
+		// Null Scheme
+		if protectionSchemeID != "0" {
+			return "", "", errors.New("userid is admitted only when protection scheme is null")
+		}
+		schemeOutput = strings.TrimPrefix(rest, ".userid")
+		homeNetworkPublicKeyID = "0"
+
+	case strings.HasPrefix(rest, ".hnkey"):
+		hnMatch := reHN.FindStringSubmatch(rest)
+		if hnMatch == nil {
+			return "", "", errors.New("invalid home network public key identifier format")
+		}
+		homeNetworkPublicKeyID = hnMatch[1]
+
+		rest = rest[len(hnMatch[0]):]
+		if strings.HasPrefix(rest, ".ecckey") {
+			// Profile A or B Scheme
+			eccMatch := reECC.FindStringSubmatch(rest)
+			if eccMatch == nil {
+				return "", "", errors.New("invalid ECC format")
+			}
+
+			ecc := eccMatch[1]
+			cip := eccMatch[2]
+			mac := eccMatch[3]
+			schemeOutput = ecc + cip + mac
+
+		} else if strings.HasPrefix(rest, ".out") {
+			// HPLMN Proprietary Scheme
+			schemeOutput = strings.TrimPrefix(rest, ".out")
+
+		} else {
+			return "", "", errors.New("unknown protection scheme output")
+		}
+
+	default:
+		return "", "", errors.New("invalid NAI username for SUCI")
+	}
+
+	// Parse MCC and MNC or NSI Realm
+	homeNetworkID := ""
+	match := rePLMN.FindStringSubmatch(realm)
+	plmnId = ""
+	if match == nil || len(match) < 3 {
+		homeNetworkID = realm
+	} else {
+		mcc := match[2]
+		mnc := match[1]
+		if len(mnc) == 3 {
+			mnc = strings.TrimPrefix(mnc, "0")
+		}
+
+		homeNetworkID = mcc + "-" + mnc
+		plmnId = mcc + mnc
+	}
+
+	// Build SUCI in UTF-8 string format
+	suci := strings.Join([]string{
+		"suci", supiType, homeNetworkID, rid, protectionSchemeID, homeNetworkPublicKeyID, schemeOutput,
+	}, "-")
+
+	return suci, plmnId, nil
 }
 
 // nasType: TS 24.501 9.11.3.4
